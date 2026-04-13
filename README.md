@@ -10,6 +10,177 @@ No extra services. No middleware. Just a native OpenWebUI Tool plus a sync scrip
 
 ---
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Setup](#setup)
+- [Configuration](#configuration)
+- [Usage Examples](#dead-simple-usage-examples)
+- [Why This Exists](#why-this-exists)
+- [Architecture](#architecture-at-a-glance)
+- [Design Choices](#design-choices-and-why-we-made-them)
+- [Pros vs. MCP](#pros-vs-mcp)
+- [Running the Tests](#running-the-tests)
+- [Health Check](#one-command-health-check)
+- [Regression Workflow](#repeatable-regression-workflow)
+- [Docker](#docker)
+- [OpenViking API Contract](#openviking-api-contract)
+- [Security](#security)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Requirements
+
+- Python **3.12+**
+- `httpx` and `pydantic` v2 (`pip install httpx pydantic`)
+- `pytest`, `pytest-asyncio` — only if you want to run the test suite
+- A reachable **OpenViking** server (default `http://localhost:1933`)
+- **OpenWebUI v0.8.x** or newer
+
+---
+
+## Setup
+
+### 1. Register the Tool
+
+1. OpenWebUI → **Workspace** → **Tools** → **+**
+2. Paste the full contents of `viking_bridge.py`
+3. Save
+4. Click the **gear icon** on the tool card → fill in the Valves
+5. In each model you want to enable it on: **Model settings → Tools → toggle on**
+
+### 2. Create a Knowledge collection (for the fallback)
+
+1. OpenWebUI → **Knowledge** → **Create Collection**
+2. Name it something obvious like `OpenViking Context`
+3. Copy the Knowledge ID from the URL
+4. Use it as `OPENWEBUI_KNOWLEDGE_ID` below
+
+### 3. Run the sync script
+
+```bash
+export OPENVIKING_BASE_URL="http://localhost:1933"
+export OPENVIKING_API_KEY="ov_live_xxxxxxxxxxxx"
+export OPENVIKING_ACCOUNT="default"
+export OPENVIKING_USER="example_user"
+export OPENVIKING_TARGET_URI="viking://resources/example_app/"
+
+export OPENWEBUI_BASE_URL="http://localhost:3000"
+export OPENWEBUI_API_TOKEN="sk-openwebui-xxxxxxxxxxxx"
+export OPENWEBUI_KNOWLEDGE_ID="kb_01HZX..."
+
+python sync_knowledge.py
+```
+
+Run it on a cron, a CI schedule, or a git hook — whatever fits. Every run keeps the fallback honest.
+
+### 4. Attach the skill
+
+Drop `viking_skill.md` into the model's system prompt (or attach it as a system-level instruction in the model settings). It tells the model **when** to call which verb, which is half the battle.
+
+---
+
+## Configuration
+
+### `viking_bridge.py` — configured through Valves
+
+After you register the tool in OpenWebUI, click the **gear icon** on its card and fill in:
+
+| Valve | Default | What it does |
+|---|---|---|
+| `openviking_base_url` | `http://localhost:1933` | Where your OpenViking lives |
+| `openviking_api_key` | *(empty)* | Your OpenViking API key |
+| `openviking_account` | `default` | Tenant/account ID |
+| `openviking_user` | *(empty)* | Default tenant/user ID |
+| `user_mapping` | *(empty)* | JSON dict: OpenWebUI user → OpenViking user (per-user ACL) |
+| `search_endpoint` | `/api/v1/search/find` | Override the search endpoint path |
+
+No environment variables needed for the tool itself. That's the whole point.
+
+### `sync_knowledge.py` — environment variables
+
+Required:
+
+| Variable | Description |
+|---|---|
+| `OPENVIKING_BASE_URL` | OpenViking server URL |
+| `OPENVIKING_API_KEY` | OpenViking API key |
+| `OPENWEBUI_BASE_URL` | OpenWebUI URL, e.g. `http://localhost:3000` |
+| `OPENWEBUI_API_TOKEN` | OpenWebUI **admin** API token |
+| `OPENWEBUI_KNOWLEDGE_ID` | Target Knowledge collection ID in OpenWebUI |
+
+Optional:
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENVIKING_ACCOUNT` | `default` | Tenant account |
+| `OPENVIKING_USER` | *(empty)* | Tenant user |
+| `OPENVIKING_TARGET_URI` | `viking://resources/` | Root URI to mirror |
+| `SYNC_TEMP_DIR` | system temp | Where intermediate Markdown lands |
+
+---
+
+## Dead-simple usage examples
+
+Once the tool is wired up, you don't call anything yourself. You just talk to the model and it picks the right verb.
+
+### Semantic discovery → `send_to_viking`
+
+> *"How does the authentication flow work in example_app?"*
+
+> *"What CORS settings does the backend ship with?"*
+
+> *"Find the order-status update implementation."*
+
+The model rephrases your question into a search, hits `/search/find`, and gets back a ranked list of URIs to follow up on.
+
+### Direct read → `query_openviking`
+
+> *"Read `viking://resources/example_app/AUTH_QUICK_REFERENCE`."*
+
+> *"Show me `viking://resources/example_app/CORS_AND_ENV_IMPLEMENTATION_GUIDE`."*
+
+The model takes the URI as-is and pulls content with the `read → overview → abstract` fallback.
+
+### Combined flow (the common case)
+
+> *"Find the rate-limiting code and explain how the token bucket is sized."*
+
+Under the hood:
+
+1. `send_to_viking("rate limiting token bucket")` → returns 3 candidate URIs
+2. `query_openviking("viking://.../rate_limit.go")` → returns the source
+3. Model reads it, explains it, cites the URI
+
+### Minimal manual call (for debugging)
+
+```python
+# inside an OpenWebUI tool runner / Function context
+result = send_to_viking("CORS configuration")
+print(result)   # -> list of {uri, score, snippet}
+
+doc = query_openviking("viking://resources/example_app/CORS_AND_ENV_IMPLEMENTATION_GUIDE")
+print(doc[:500])
+```
+
+### Write-back → `write_to_viking`
+
+> *"Summarize the rate-limiting design and save it to `viking://resources/example_app/RATE_LIMIT_SUMMARY`."*
+
+Under the hood:
+1. `send_to_viking("rate limiting")` → finds the URIs
+2. `query_openviking("viking://.../rate_limit.go")` → reads the source
+3. `write_to_viking("viking://.../RATE_LIMIT_SUMMARY", "...")` → writes the summary back
+4. Session tracked as `webui_{user_id}_{chat_id}`
+
+### Knowledge fallback
+
+If OpenViking is unreachable, the model falls back to searching the synced Knowledge collection for files named `viking_context_<path>.md`. Same content, slightly stale — better than nothing.
+
+---
+
 ## Why this exists
 
 Local stacks built on Ollama + OpenWebUI are great at reasoning and terrible at remembering. You can upload static docs, sure — but a week later your repo has moved on and the model is quoting yesterday's truth with full confidence.
@@ -87,158 +258,6 @@ Two paths, one purpose: the **Tool** is the live wire, the **Knowledge sync** is
 
 ---
 
-## Requirements
-
-- Python **3.12+**
-- `httpx` and `pydantic` v2 (`pip install httpx pydantic`)
-- `pytest`, `pytest-asyncio` — only if you want to run the test suite
-- A reachable **OpenViking** server (default `http://localhost:1933`)
-- **OpenWebUI v0.8.x** or newer
-
----
-
-## Configuration
-
-### `viking_bridge.py` — configured through Valves
-
-After you register the tool in OpenWebUI, click the **gear icon** on its card and fill in:
-
-| Valve | Default | What it does |
-|---|---|---|
-| `openviking_base_url` | `http://localhost:1933` | Where your OpenViking lives |
-| `openviking_api_key` | *(empty)* | Your OpenViking API key |
-| `openviking_account` | `default` | Tenant/account ID |
-| `openviking_user` | *(empty)* | Default tenant/user ID |
-| `user_mapping` | *(empty)* | JSON dict: OpenWebUI user → OpenViking user (per-user ACL) |
-| `search_endpoint` | `/api/v1/search/find` | Override the search endpoint path |
-
-No environment variables needed for the tool itself. That's the whole point.
-
-### `sync_knowledge.py` — environment variables
-
-Required:
-
-| Variable | Description |
-|---|---|
-| `OPENVIKING_BASE_URL` | OpenViking server URL |
-| `OPENVIKING_API_KEY` | OpenViking API key |
-| `OPENWEBUI_BASE_URL` | OpenWebUI URL, e.g. `http://localhost:3000` |
-| `OPENWEBUI_API_TOKEN` | OpenWebUI **admin** API token |
-| `OPENWEBUI_KNOWLEDGE_ID` | Target Knowledge collection ID in OpenWebUI |
-
-Optional:
-
-| Variable | Default | Description |
-|---|---|---|
-| `OPENVIKING_ACCOUNT` | `default` | Tenant account |
-| `OPENVIKING_USER` | *(empty)* | Tenant user |
-| `OPENVIKING_TARGET_URI` | `viking://resources/` | Root URI to mirror |
-| `SYNC_TEMP_DIR` | system temp | Where intermediate Markdown lands |
-
----
-
-## Setup
-
-### 1. Register the Tool
-
-1. OpenWebUI → **Workspace** → **Tools** → **+**
-2. Paste the full contents of `viking_bridge.py`
-3. Save
-4. Click the **gear icon** on the tool card → fill in the Valves
-5. In each model you want to enable it on: **Model settings → Tools → toggle on**
-
-### 2. Create a Knowledge collection (for the fallback)
-
-1. OpenWebUI → **Knowledge** → **Create Collection**
-2. Name it something obvious like `OpenViking Context`
-3. Copy the Knowledge ID from the URL
-4. Use it as `OPENWEBUI_KNOWLEDGE_ID` below
-
-### 3. Run the sync script
-
-```bash
-export OPENVIKING_BASE_URL="http://localhost:1933"
-export OPENVIKING_API_KEY="ov_live_xxxxxxxxxxxx"
-export OPENVIKING_ACCOUNT="default"
-export OPENVIKING_USER="example_user"
-export OPENVIKING_TARGET_URI="viking://resources/example_app/"
-
-export OPENWEBUI_BASE_URL="http://localhost:3000"
-export OPENWEBUI_API_TOKEN="sk-openwebui-xxxxxxxxxxxx"
-export OPENWEBUI_KNOWLEDGE_ID="kb_01HZX..."
-
-python sync_knowledge.py
-```
-
-Run it on a cron, a CI schedule, or a git hook — whatever fits. Every run keeps the fallback honest.
-
-### 4. Attach the skill
-
-Drop `viking_skill.md` into the model's system prompt (or attach it as a system-level instruction in the model settings). It tells the model **when** to call which verb, which is half the battle.
-
----
-
-## Dead-simple usage examples
-
-Once the tool is wired up, you don't call anything yourself. You just talk to the model and it picks the right verb. Examples of prompts that trigger each path:
-
-### Semantic discovery → `send_to_viking`
-
-> *"How does the authentication flow work in example_app?"*
-
-> *"What CORS settings does the backend ship with?"*
-
-> *"Find the order-status update implementation."*
-
-The model rephrases your question into a search, hits `/search/find`, and gets back a ranked list of URIs to follow up on.
-
-### Direct read → `query_openviking`
-
-> *"Read `viking://resources/example_app/AUTH_QUICK_REFERENCE`."*
-
-> *"Show me `viking://resources/example_app/CORS_AND_ENV_IMPLEMENTATION_GUIDE`."*
-
-The model takes the URI as-is and pulls content with the `read → overview → abstract` fallback.
-
-### Combined flow (the common case)
-
-> *"Find the rate-limiting code and explain how the token bucket is sized."*
-
-Under the hood:
-
-1. `send_to_viking("rate limiting token bucket")` → returns 3 candidate URIs
-2. `query_openviking("viking://.../rate_limit.go")` → returns the source
-3. Model reads it, explains it, cites the URI
-
-### Minimal manual call (for debugging)
-
-If you want to test the tool directly from a Python REPL inside OpenWebUI:
-
-```python
-# inside an OpenWebUI tool runner / Function context
-result = send_to_viking("CORS configuration")
-print(result)   # -> list of {uri, score, snippet}
-
-doc = query_openviking("viking://resources/example_app/CORS_AND_ENV_IMPLEMENTATION_GUIDE")
-print(doc[:500])
-```
-
-### Write-back → `write_to_viking`
-
-> *"Summarize the rate-limiting design and save it to `viking://resources/example_app/RATE_LIMIT_SUMMARY`."*
-
-Under the hood:
-1. `send_to_viking("rate limiting")` → finds the URIs
-2. `query_openviking("viking://.../rate_limit.go")` → reads the source
-3. `write_to_viking("viking://.../RATE_LIMIT_SUMMARY", "...")` → writes the summary back
-4. Session tracked as `webui_{user_id}_{chat_id}`
-
-### Knowledge fallback
-
-If OpenViking is unreachable, the model falls back to searching the synced Knowledge collection for files named `viking_context_<path>.md`. Same content, slightly stale — better than nothing.
-
----
-
 ## Pros vs. MCP
 
 | | ov-oi-v1 Bridge | Raw MCP (`:2033/mcp`) |
@@ -280,7 +299,7 @@ This walks the whole runtime chain end-to-end:
 - ✅ OpenViking is reachable using those same Valves
 - ✅ The selected model can actually invoke `send_to_viking` and `query_openviking` end-to-end
 
-**Auth options for the health check:**
+**Auth options:**
 
 - *Preferred:* set `OPENWEBUI_API_TOKEN`
 - *Fallback (local installs only):* the script can mint a JWT itself if it can read `~/.webui_secret_key` and find `webui.db`
@@ -437,14 +456,14 @@ In short, you can:
 
 You must:
 
-- 📌 Include the license and copyright notice with any redistribution
-- 📌 State significant changes you made
-- 📌 Not use contributor names/trademarks for endorsement without permission
+- Include the license and copyright notice with any redistribution
+- State significant changes you made
+- Not use contributor names/trademarks for endorsement without permission
 
 You cannot:
 
-- ❌ Hold contributors liable
-- ❌ Expect any warranty
+- Hold contributors liable
+- Expect any warranty
 
 ```
 Copyright 2026 The ov-oi-v1 Contributors
