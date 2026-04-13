@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://gemini.google.com/share/4ece03b9490d" alt="ov-oi-v1" />
+  <img src="./Oh-Boy-OV-OI.png" alt="ov-oi-v1" />
 </p>
 
 # ov-oi-v1 — OpenViking ↔ OpenWebUI Bridge
