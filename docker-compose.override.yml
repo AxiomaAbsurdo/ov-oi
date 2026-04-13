@@ -1,0 +1,14 @@
+version: "3.8"
+
+# Override for injecting OpenViking env vars into an existing OpenWebUI
+# docker-compose setup. Place this file next to the main docker-compose.yml.
+
+services:
+  open-webui:
+    environment:
+      - OPENVIKING_BASE_URL=http://host.docker.internal:1933
+      - OPENVIKING_API_KEY=${OPENVIKING_API_KEY}
+      - OPENVIKING_ACCOUNT=default
+      - OPENVIKING_USER=${OPENVIKING_USER:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
